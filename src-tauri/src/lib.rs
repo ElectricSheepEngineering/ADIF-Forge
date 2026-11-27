@@ -1,10 +1,10 @@
 mod adif;
 
-use adif::{parse_adif, serialize_adif, AdifDocument};
+use adif::{parse_adif, serialize_adif, to_csv, AdifDocument, ParseOutcome};
 use std::fs;
 
 #[tauri::command]
-fn load_adif_file(path: String) -> Result<AdifDocument, String> {
+fn load_adif_file(path: String) -> Result<ParseOutcome, String> {
     let content = fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read file {}: {}", path, e))?;
     Ok(parse_adif(&content))
@@ -19,28 +19,22 @@ fn save_adif_file(path: String, doc: AdifDocument) -> Result<(), String> {
 
 #[tauri::command]
 fn export_csv_file(path: String, doc: AdifDocument) -> Result<(), String> {
-    let mut csv = String::new();
-    csv.push_str(&doc.columns.join(","));
-    csv.push('\n');
+    fs::write(&path, to_csv(&doc)).map_err(|e| format!("Failed to export CSV: {}", e))
+}
 
-    for rec in &doc.records {
-        let row: Vec<String> = doc
-            .columns
-            .iter()
-            .map(|col| {
-                let val = rec.get(col).cloned().unwrap_or_default();
-                if val.contains(',') || val.contains('"') || val.contains('\n') {
-                    format!("\"{}\"", val.replace('"', "\"\""))
-                } else {
-                    val
-                }
-            })
-            .collect();
-        csv.push_str(&row.join(","));
-        csv.push('\n');
-    }
+#[tauri::command]
+fn render_adif(doc: AdifDocument) -> String {
+    serialize_adif(&doc)
+}
 
-    fs::write(&path, csv).map_err(|e| format!("Failed to export CSV: {}", e))
+#[tauri::command]
+fn render_csv(doc: AdifDocument) -> String {
+    to_csv(&doc)
+}
+
+#[tauri::command]
+fn parse_adif_text(text: String) -> ParseOutcome {
+    parse_adif(&text)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -51,7 +45,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_adif_file,
             save_adif_file,
-            export_csv_file
+            export_csv_file,
+            render_adif,
+            render_csv,
+            parse_adif_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

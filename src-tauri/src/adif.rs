@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AdifDocument {
     pub header_text: String,
     pub headers: BTreeMap<String, String>,
@@ -9,132 +9,154 @@ pub struct AdifDocument {
     pub records: Vec<BTreeMap<String, String>>,
 }
 
-/// Parses raw ADIF (.adi) content into a structured table format.
-pub fn parse_adif(input: &str) -> AdifDocument {
-    let mut header_text = String::new();
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParseOutcome {
+    pub document: AdifDocument,
+    pub warnings: Vec<String>,
+}
+
+enum Item {
+    Field { name: String, value: String },
+    Marker(String),
+}
+
+/// Parses raw ADIF (.adi) content. Field order is first-seen. A bad length is
+/// reported and does not fail the rest of the file.
+pub fn parse_adif(input: &str) -> ParseOutcome {
+    let mut warnings = Vec::new();
     let mut headers = BTreeMap::new();
     let mut records = Vec::new();
-    let mut column_set = BTreeSet::new();
+    let mut columns = Vec::new();
 
-    // Standard priority columns to appear first in the grid
-    let priority_cols = [
-        "QSO_DATE", "TIME_ON", "CALL", "BAND", "FREQ", "MODE", "SUBMODE",
-        "RST_SENT", "RST_RCVD", "GRIDSQUARE", "MY_GRIDSQUARE", "NAME", "QTH", "COMMENT"
-    ];
-
-    let lower = input.to_lowercase();
-    let body_start = if let Some(eoh_idx) = lower.find("<eoh>") {
-        let header_section = &input[..eoh_idx];
-        // Capture free-form text before the first tag
-        if let Some(first_tag) = header_section.find('<') {
-            header_text = header_section[..first_tag].trim().to_string();
-        } else {
-            header_text = header_section.trim().to_string();
-        }
-        headers = parse_tags(header_section);
-        eoh_idx + 5
-    } else {
-        0
+    let (header_section, body) = split_header(input);
+    let header_text = match header_section.find('<') {
+        Some(first_tag) => header_section[..first_tag].trim().to_string(),
+        None => header_section.trim().to_string(),
     };
 
+    for item in scan_tags(header_section, &mut warnings) {
+        if let Item::Field { name, value } = item {
+            headers.insert(name, value);
+        }
+    }
+
     let mut current_record: BTreeMap<String, String> = BTreeMap::new();
-    let mut chars = input[body_start..].char_indices().peekable();
-
-    while let Some((idx, ch)) = chars.next() {
-        if ch == '<' {
-            // Read until '>'
-            let mut tag_content = String::new();
-            let mut end_tag_byte = None;
-
-            while let Some((t_idx, t_ch)) = chars.next() {
-                if t_ch == '>' {
-                    end_tag_byte = Some(body_start + t_idx + 1);
-                    break;
-                }
-                tag_content.push(t_ch);
-            }
-
-            let Some(_) = end_tag_byte else { break };
-            let parts: Vec<&str> = tag_content.split(':').collect();
-            let field_name = parts[0].trim().to_uppercase();
-
-            if field_name == "EOR" {
+    for item in scan_tags(body, &mut warnings) {
+        match item {
+            Item::Marker(name) if name == "EOR" => {
                 if !current_record.is_empty() {
                     records.push(current_record);
                     current_record = BTreeMap::new();
                 }
-                continue;
             }
-
-            if parts.len() >= 2 {
-                if let Ok(len) = parts[1].trim().parse::<usize>() {
-                    // Extract exact `len` characters for the field value
-                    let mut value = String::with_capacity(len);
-                    for _ in 0..len {
-                        if let Some((_, v_ch)) = chars.next() {
-                            value.push(v_ch);
-                        }
-                    }
-                    column_set.insert(field_name.clone());
-                    current_record.insert(field_name, value);
+            Item::Field { name, value } => {
+                if !columns.contains(&name) {
+                    columns.push(name.clone());
                 }
+                current_record.insert(name, value);
             }
-            let _ = idx; // silence unused warning
+            Item::Marker(_) => {}
         }
     }
-
-    // Flush trailing record if file lacked final <EOR>
     if !current_record.is_empty() {
         records.push(current_record);
     }
 
-    // Order columns: Priority columns first, then alphabetical
-    let mut columns = Vec::new();
-    for &p in &priority_cols {
-        if column_set.remove(p) {
-            columns.push(p.to_string());
-        }
-    }
-    for col in column_set {
-        columns.push(col);
-    }
-
-    AdifDocument {
-        header_text,
-        headers,
-        columns,
-        records,
+    ParseOutcome {
+        document: AdifDocument {
+            header_text,
+            headers,
+            columns,
+            records,
+        },
+        warnings,
     }
 }
 
-fn parse_tags(section: &str) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    let mut chars = section.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        if ch == '<' {
-            let mut tag = String::new();
-            while let Some((_, t_ch)) = chars.next() {
-                if t_ch == '>' { break; }
-                tag.push(t_ch);
+/// Case-insensitive `<eoh>` in the original byte indexes. Lowercasing the
+/// whole text can change byte length and swallow the first QSOs.
+fn split_header(input: &str) -> (&str, &str) {
+    match find_ascii_ci(input, "<eoh>") {
+        Some(start) => (&input[..start], &input[start + "<eoh>".len()..]),
+        None => ("", input),
+    }
+}
+
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    let last = h.len() - n.len();
+    let mut i = 0;
+    while i <= last {
+        if haystack.is_char_boundary(i) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn scan_tags(section: &str, warnings: &mut Vec<String>) -> Vec<Item> {
+    let mut chars = section.chars().peekable();
+    let mut items = Vec::new();
+
+    while let Some(ch) = chars.next() {
+        if ch != '<' {
+            continue;
+        }
+        let mut tag = String::new();
+        let mut closed = false;
+        for t_ch in chars.by_ref() {
+            if t_ch == '>' {
+                closed = true;
+                break;
             }
-            let parts: Vec<&str> = tag.split(':').collect();
-            if parts.len() >= 2 {
-                if let Ok(len) = parts[1].trim().parse::<usize>() {
-                    let mut val = String::with_capacity(len);
-                    for _ in 0..len {
-                        if let Some((_, v_ch)) = chars.next() {
-                            val.push(v_ch);
-                        }
-                    }
-                    map.insert(parts[0].trim().to_uppercase(), val);
+            tag.push(t_ch);
+        }
+        if !closed {
+            warnings.push("unclosed tag".to_string());
+            break;
+        }
+
+        let parts: Vec<&str> = tag.split(':').collect();
+        let name = parts[0].trim().to_uppercase();
+        if name.is_empty() {
+            continue;
+        }
+        if parts.len() < 2 {
+            items.push(Item::Marker(name));
+            continue;
+        }
+        let Ok(len) = parts[1].trim().parse::<usize>() else {
+            warnings.push(format!("field {name} has a bad length"));
+            continue;
+        };
+
+        let mut value = String::with_capacity(len);
+        let mut complete = true;
+        for _ in 0..len {
+            match chars.next() {
+                Some(v_ch) => value.push(v_ch),
+                None => {
+                    complete = false;
+                    break;
                 }
             }
         }
+        if !complete {
+            warnings.push(format!("field {name} was truncated"));
+        }
+        items.push(Item::Field { name, value });
     }
-    map
+
+    items
 }
 
-/// Serializes an AdifDocument back into valid ADIF 3.1.x text (one QSO per line like ADIF Master).
+/// Serializes an AdifDocument back into ADIF text. Empty values are omitted.
+/// `ADIF_VER` and `PROGRAMID` are always rewritten.
 pub fn serialize_adif(doc: &AdifDocument) -> String {
     let mut out = String::new();
 
@@ -155,7 +177,6 @@ pub fn serialize_adif(doc: &AdifDocument) -> String {
     out.push_str("<EOH>\n\n");
 
     for record in &doc.records {
-        // Write fields following the active column order first
         for col in &doc.columns {
             if let Some(val) = record.get(col) {
                 if !val.is_empty() {
@@ -163,7 +184,6 @@ pub fn serialize_adif(doc: &AdifDocument) -> String {
                 }
             }
         }
-        // Write any remaining fields not in `columns`
         for (k, val) in record {
             if !doc.columns.contains(k) && !val.is_empty() {
                 out.push_str(&format!("<{}:{}>{} ", k, val.chars().count(), val));
@@ -173,4 +193,116 @@ pub fn serialize_adif(doc: &AdifDocument) -> String {
     }
 
     out
+}
+
+pub fn to_csv(doc: &AdifDocument) -> String {
+    let mut csv = String::new();
+    csv.push_str(&doc.columns.join(","));
+    csv.push('\n');
+
+    for rec in &doc.records {
+        let row: Vec<String> = doc
+            .columns
+            .iter()
+            .map(|col| {
+                let val = rec.get(col).cloned().unwrap_or_default();
+                if val.contains(',') || val.contains('"') || val.contains('\n') {
+                    format!("\"{}\"", val.replace('"', "\"\""))
+                } else {
+                    val
+                }
+            })
+            .collect();
+        csv.push_str(&row.join(","));
+        csv.push('\n');
+    }
+
+    csv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call<'a>(doc: &'a AdifDocument, row: usize) -> Option<&'a str> {
+        doc.records.get(row).and_then(|r| r.get("CALL")).map(String::as_str)
+    }
+
+    #[test]
+    fn round_trip_keeps_qso_fields() {
+        let input = "<eoh><call:3>K1A <band:3>20m <eor>\n";
+        let first = parse_adif(input);
+        assert!(first.warnings.is_empty());
+        let again = parse_adif(&serialize_adif(&first.document));
+        assert_eq!(again.document.records, first.document.records);
+        assert!(again.document.columns.contains(&"CALL".to_string()));
+        assert!(again.document.columns.contains(&"BAND".to_string()));
+    }
+
+    #[test]
+    fn columns_follow_first_seen_order() {
+        let parsed = parse_adif("<eoh><notes:3>abc <call:3>K1A <eor>");
+        assert_eq!(parsed.document.columns, vec!["NOTES".to_string(), "CALL".to_string()]);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn data_type_indicator_is_not_the_length() {
+        let parsed = parse_adif("<eoh><call:6:S>WN4AZY<eor>");
+        assert_eq!(call(&parsed.document, 0), Some("WN4AZY"));
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn bad_length_is_reported_and_the_rest_of_the_qso_remains() {
+        let parsed = parse_adif("<eoh><call:zz>K1ABC<band:3>20m<eor>");
+        assert_eq!(parsed.warnings, vec!["field CALL has a bad length".to_string()]);
+        assert_eq!(call(&parsed.document, 0), None);
+        assert_eq!(
+            parsed.document.records[0].get("BAND").map(String::as_str),
+            Some("20m")
+        );
+    }
+
+    #[test]
+    fn truncated_field_is_reported() {
+        let parsed = parse_adif("<eoh><call:10>ABC");
+        assert_eq!(parsed.warnings, vec!["field CALL was truncated".to_string()]);
+        assert_eq!(call(&parsed.document, 0), Some("ABC"));
+    }
+
+    #[test]
+    fn multibyte_header_text_does_not_swallow_the_qso() {
+        let parsed = parse_adif("İ<eoh>\n<call:3>ABC<eor>");
+        assert_eq!(call(&parsed.document, 0), Some("ABC"));
+        assert!(parsed.warnings.is_empty());
+        assert!(parsed.document.header_text.contains('İ'));
+    }
+
+    #[test]
+    fn length_counts_characters() {
+        let parsed = parse_adif("<eoh><name:1>éX<eor>");
+        assert_eq!(
+            parsed.document.records[0].get("NAME").map(String::as_str),
+            Some("é")
+        );
+    }
+
+    #[test]
+    fn serialize_omits_empty_values_and_rewrites_program_tags() {
+        let parsed = parse_adif("<adif_ver:3>2.0 <eoh><call:3>K1A <name:0><eor>");
+        let out = serialize_adif(&parsed.document);
+        assert!(out.contains("<ADIF_VER:5>3.1.6"));
+        assert!(out.contains("<PROGRAMID:10>ADIF Forge"));
+        assert!(!out.contains("<NAME"));
+        assert!(!out.contains("<ADIF_VER:3>2.0"));
+    }
+
+    #[test]
+    fn csv_quotes_commas_and_quotes() {
+        let mut doc = parse_adif("<eoh><call:3>K1A <comment:14>hello, \"world\"<eor>").document;
+        doc.columns = vec!["CALL".into(), "COMMENT".into()];
+        let csv = to_csv(&doc);
+        assert_eq!(csv, "CALL,COMMENT\nK1A,\"hello, \"\"world\"\"\"\n");
+    }
 }
