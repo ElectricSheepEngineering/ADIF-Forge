@@ -1,0 +1,80 @@
+name: Release
+
+# A tag push is its own ref update. Listening only to tags means a push that
+# updates a branch and a tag together starts this workflow for the tag and
+# does not start a build of the branch. The job condition repeats that check.
+on:
+  push:
+    tags:
+      - "*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --no-bundle --target aarch64-apple-darwin
+          - platform: macos-latest
+            args: --no-bundle --target x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: --no-bundle
+          - platform: windows-latest
+            args: --no-bundle
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and upload the executable
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: ADIF Forge ${{ github.ref_name }}
+          releaseBody: Standalone executables built from this tag.
+          releaseCommitish: ${{ github.sha }}
+          releaseDraft: false
+          prerelease: false
+          uploadPlainBinary: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          retryAttempts: 3
+          releaseAssetNamePattern: "[mainBinaryName]-[platform]-[arch][ext]"
+          args: ${{ matrix.args }}
