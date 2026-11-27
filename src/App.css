@@ -100,6 +100,14 @@ button.danger-btn:not(:disabled) {
   color: var(--text-bright);
   outline: none;
   font-size: 12px;
+  width: 22ch;
+}
+
+.notice {
+  background: #3a2f1a;
+  color: #f6d48a;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
 }
 
 .bulk-drawer {
@@ -201,10 +209,19 @@ select,
 
 .status-bar {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
   padding: 4px 12px;
   background: var(--surface);
   border-top: 1px solid var(--border);
   font-size: 11px;
   color: #9ca3af;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+  color: var(--text);
 }

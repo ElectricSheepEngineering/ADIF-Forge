@@ -5,9 +5,7 @@ export interface AdifDocument {
   records: Record<string, string>[];
 }
 
-export type BulkOperation =
-  | { type: "FILL"; column: string; value: string; onlyEmpty: boolean }
-  | { type: "REPLACE"; column: string; find: string; replace: string; useRegex: boolean }
-  | { type: "CASE"; column: string; mode: "UPPER" | "LOWER" }
-  | { type: "COPY_FROM"; targetColumn: string; sourceColumn: string }
-  | { type: "DERIVE_BAND_FROM_FREQ" };
+export interface ParseOutcome {
+  document: AdifDocument;
+  warnings: string[];
+}
