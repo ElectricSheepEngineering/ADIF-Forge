@@ -28,20 +28,30 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ github.ref_name }}"
-          if gh release view "$tag" --json isDraft --jq .isDraft > /tmp/draft-state 2>/dev/null; then
-            if [ "$(cat /tmp/draft-state)" != "true" ]; then
-              echo "Release $tag is already published. An immutable release cannot accept more assets."
+          repo="${{ github.repository }}"
+          # Use the API directly. gh release create looks for a local git checkout,
+          # and this job does not have one.
+          if id_and_draft=$(gh api "repos/${repo}/releases/tags/${tag}" --jq '"\(.id) \(.draft)"' 2>/tmp/gh-err); then
+            id="${id_and_draft%% *}"
+            draft="${id_and_draft##* }"
+            if [ "$draft" != "true" ]; then
+              echo "Release ${tag} is already published. An immutable release cannot accept more assets."
               exit 1
             fi
           else
-            gh release create "$tag" \
-              --draft \
-              --title "ADIF Forge $tag" \
-              --notes "Standalone executables built from this tag." \
-              --target "${{ github.sha }}"
+            if ! grep -q 'Not Found' /tmp/gh-err; then
+              cat /tmp/gh-err >&2
+              exit 1
+            fi
+            id=$(gh api --method POST "repos/${repo}/releases" \
+              -f tag_name="$tag" \
+              -f target_commitish="${{ github.sha }}" \
+              -f name="ADIF Forge ${tag}" \
+              -f body="Standalone executables built from this tag." \
+              -F draft=true \
+              --jq .id)
           fi
-          id="$(gh release view "$tag" --json databaseId --jq .databaseId)"
-          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          echo "release_id=${id}" >> "$GITHUB_OUTPUT"
 
   release:
     needs: prepare
@@ -108,7 +118,7 @@ jobs:
           args: ${{ matrix.args }}
 
   publish:
-    needs: release
+    needs: [prepare, release]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -117,4 +127,8 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --draft=false
+        run: |
+          gh api --method PATCH \
+            "repos/${{ github.repository }}/releases/${{ needs.prepare.outputs.release_id }}" \
+            -F draft=false \
+            --jq .html_url
