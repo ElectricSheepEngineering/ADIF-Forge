@@ -13,7 +13,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - name: Create a draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" --json isDraft --jq .isDraft > /tmp/draft-state 2>/dev/null; then
+            if [ "$(cat /tmp/draft-state)" != "true" ]; then
+              echo "Release $tag is already published. An immutable release cannot accept more assets."
+              exit 1
+            fi
+          else
+            gh release create "$tag" \
+              --draft \
+              --title "ADIF Forge $tag" \
+              --notes "Standalone executables built from this tag." \
+              --target "${{ github.sha }}"
+          fi
+          id="$(gh release view "$tag" --json databaseId --jq .databaseId)"
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
   release:
+    needs: prepare
     if: github.ref_type == 'tag'
     permissions:
       contents: write
@@ -66,11 +97,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: ADIF Forge ${{ github.ref_name }}
-          releaseBody: Standalone executables built from this tag.
-          releaseCommitish: ${{ github.sha }}
-          releaseDraft: false
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          releaseDraft: true
           prerelease: false
           uploadPlainBinary: true
           uploadUpdaterJson: false
@@ -78,3 +106,15 @@ jobs:
           retryAttempts: 3
           releaseAssetNamePattern: "[mainBinaryName]-[platform]-[arch][ext]"
           args: ${{ matrix.args }}
+
+  publish:
+    needs: release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false
